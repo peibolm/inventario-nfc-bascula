@@ -31,6 +31,8 @@ typedef enum {
     APP_EVT_UI_SETTINGS_PRESSED,       /* boton "Ajustes" en reposo */
     APP_EVT_UI_SETTINGS_ROW_PRESSED,   /* fila de la lista de ajustes tocada */
     APP_EVT_UI_SETTINGS_RESET_PRESSED, /* "Restablecer valores de fabrica" */
+    APP_EVT_UI_PARTIAL_NUEVAS_PRESSED, /* "NUEVAS" en la pesada por partes */
+    APP_EVT_UI_PARTIAL_USADAS_PRESSED, /* "USADAS" en la pesada por partes */
 } app_event_type_t;
 
 typedef struct {

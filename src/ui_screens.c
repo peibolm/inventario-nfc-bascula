@@ -52,10 +52,28 @@ static lv_obj_t *s_stat_diff_usadas;  /* idem, bajo el numero de usadas */
 /* Fijados una vez por ui_show_wait_weight_used(), consultados en cada
  * lectura por ui_update_wait_weight_live() para no tener que pasarlos en
  * cada llamada (igual que peso_total/uds_totales, que tambien son fijos
- * durante todo el recuento de un articulo). */
+ * durante todo el recuento de un articulo). Los reutiliza tambien la
+ * pantalla de pesada por partes. */
 static bool s_referencia_activa = false;
 static int s_referencia_nuevas = 0;
 static int s_referencia_usadas = 0;
+
+/* Pantalla ui_show_partial_count(): 3 columnas (tanda actual + los dos
+ * acumulados) y los dos botones grandes de clasificar. */
+static lv_obj_t *s_cont_partial;
+static lv_obj_t *s_partial_value_tanda;
+static lv_obj_t *s_partial_value_nuevas;
+static lv_obj_t *s_partial_value_usadas;
+static lv_obj_t *s_partial_hint_tanda;   /* "Vacie el recipiente" / "Esperando estable..." */
+static lv_obj_t *s_partial_diff_nuevas;  /* diferencia contra inventario_referencia.csv */
+static lv_obj_t *s_partial_diff_usadas;
+static lv_obj_t *s_btn_partial_nuevas;
+static lv_obj_t *s_btn_partial_usadas;
+
+/* Instruccion de la pantalla de tara en curso: la fijan ui_show_wait_tare()
+ * / ui_show_partial_tare() y la reutiliza ui_update_wait_tare_reading() al
+ * repintar con cada lectura, para no duplicar la funcion de refresco. */
+static const char *s_tare_instruccion = "";
 
 static bool s_keypad_active = false;
 static bool s_keypad_allow_decimal = false;
@@ -96,6 +114,20 @@ static void cancel_btn_event_cb(lv_event_t *e)
 {
     (void)e;
     app_event_t evt = {.type = APP_EVT_UI_CANCEL_PRESSED};
+    app_events_post(&evt);
+}
+
+static void partial_nuevas_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    app_event_t evt = {.type = APP_EVT_UI_PARTIAL_NUEVAS_PRESSED};
+    app_events_post(&evt);
+}
+
+static void partial_usadas_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    app_event_t evt = {.type = APP_EVT_UI_PARTIAL_USADAS_PRESSED};
     app_events_post(&evt);
 }
 
@@ -304,6 +336,9 @@ static void hide_interactive_widgets(void)
     set_widget_visible(s_led_stable, false);
     set_widget_visible(s_label_retire_nuevos, false);
     set_widget_visible(s_cont_stats, false);
+    set_widget_visible(s_cont_partial, false);
+    set_widget_visible(s_btn_partial_nuevas, false);
+    set_widget_visible(s_btn_partial_usadas, false);
     set_widget_visible(s_label_detail, true);
 
     lv_label_set_text(s_label_btn_confirm, "Confirmar");
@@ -402,6 +437,60 @@ void ui_screens_init(lv_disp_t *disp)
     s_stat_diff_usadas = lv_label_create(lv_obj_get_parent(s_stat_value_usadas));
     lv_obj_set_style_text_font(s_stat_diff_usadas, &lv_font_montserrat_14, 0);
     lv_label_set_text(s_stat_diff_usadas, "");
+
+    /* Pantalla ui_show_partial_count(): mismas 3 columnas de estilo que
+     * arriba, pero mas arriba en pantalla - aqui hay dos filas de botones
+     * (NUEVAS/USADAS grandes, y debajo Deshacer/Finalizar/Cancelar) en vez
+     * de una sola. */
+    s_cont_partial = lv_obj_create(scr);
+    lv_obj_set_size(s_cont_partial, 460, 104);
+    lv_obj_align(s_cont_partial, LV_ALIGN_BOTTOM_MID, 0, -118);
+    lv_obj_set_style_bg_opa(s_cont_partial, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_cont_partial, 0, 0);
+    lv_obj_set_style_pad_all(s_cont_partial, 0, 0);
+    lv_obj_clear_flag(s_cont_partial, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(s_cont_partial, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_cont_partial, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    s_partial_value_tanda = create_stat_column(s_cont_partial, "Tanda actual");
+    s_partial_value_nuevas = create_stat_column(s_cont_partial, "Nuevas");
+    s_partial_value_usadas = create_stat_column(s_cont_partial, "Usadas");
+
+    s_partial_hint_tanda = lv_label_create(lv_obj_get_parent(s_partial_value_tanda));
+    lv_obj_set_style_text_font(s_partial_hint_tanda, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_partial_hint_tanda, lv_palette_darken(LV_PALETTE_GREY, 1), 0);
+    lv_label_set_text(s_partial_hint_tanda, "");
+
+    s_partial_diff_nuevas = lv_label_create(lv_obj_get_parent(s_partial_value_nuevas));
+    lv_obj_set_style_text_font(s_partial_diff_nuevas, &lv_font_montserrat_14, 0);
+    lv_label_set_text(s_partial_diff_nuevas, "");
+
+    s_partial_diff_usadas = lv_label_create(lv_obj_get_parent(s_partial_value_usadas));
+    lv_obj_set_style_text_font(s_partial_diff_usadas, &lv_font_montserrat_14, 0);
+    lv_label_set_text(s_partial_diff_usadas, "");
+
+    /* Los dos botones de clasificar: son la accion que se repite en cada
+     * tanda, asi que van grandes y con color propio (verde/gris azulado)
+     * para no confundirlos de un vistazo estando uno al lado del otro. */
+    s_btn_partial_nuevas = lv_btn_create(scr);
+    lv_obj_set_size(s_btn_partial_nuevas, 210, 54);
+    lv_obj_align(s_btn_partial_nuevas, LV_ALIGN_BOTTOM_LEFT, 14, -58);
+    lv_obj_set_style_bg_color(s_btn_partial_nuevas, lv_palette_main(LV_PALETTE_GREEN), 0);
+    lv_obj_add_event_cb(s_btn_partial_nuevas, partial_nuevas_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *label_btn_partial_nuevas = lv_label_create(s_btn_partial_nuevas);
+    lv_label_set_text(label_btn_partial_nuevas, "NUEVAS");
+    lv_obj_set_style_text_font(label_btn_partial_nuevas, &lv_font_montserrat_20, 0);
+    lv_obj_center(label_btn_partial_nuevas);
+
+    s_btn_partial_usadas = lv_btn_create(scr);
+    lv_obj_set_size(s_btn_partial_usadas, 210, 54);
+    lv_obj_align(s_btn_partial_usadas, LV_ALIGN_BOTTOM_RIGHT, -14, -58);
+    lv_obj_set_style_bg_color(s_btn_partial_usadas, lv_palette_darken(LV_PALETTE_BLUE_GREY, 1), 0);
+    lv_obj_add_event_cb(s_btn_partial_usadas, partial_usadas_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *label_btn_partial_usadas = lv_label_create(s_btn_partial_usadas);
+    lv_label_set_text(label_btn_partial_usadas, "USADAS");
+    lv_obj_set_style_text_font(label_btn_partial_usadas, &lv_font_montserrat_20, 0);
+    lv_obj_center(label_btn_partial_usadas);
 
     s_btn_confirm = lv_btn_create(scr);
     lv_obj_add_event_cb(s_btn_confirm, confirm_btn_event_cb, LV_EVENT_CLICKED, NULL);
@@ -674,7 +763,7 @@ void ui_show_saving(void)
     bsp_display_unlock();
 }
 
-void ui_show_description_and_wait_weight(const char *descripcion)
+void ui_show_description_and_wait_weight(const char *descripcion, bool permitir_por_partes)
 {
     char titulo[80];
     sanitize_for_display(descripcion, titulo, sizeof(titulo));
@@ -683,6 +772,18 @@ void ui_show_description_and_wait_weight(const char *descripcion)
     hide_interactive_widgets();
     set_title(titulo);
     lv_label_set_text(s_label_detail, "Coloque la caja completa en la bascula y espere...");
+
+    if (permitir_por_partes) {
+        /* Dos botones en fila: la salida de emergencia para cajas que no
+         * caben en la bascula, y Cancelar. */
+        lv_obj_set_size(s_btn_retry, 210, 60);
+        lv_obj_align(s_btn_retry, LV_ALIGN_BOTTOM_LEFT, 14, -20);
+        lv_obj_set_size(s_btn_cancel, 210, 60);
+        lv_obj_align(s_btn_cancel, LV_ALIGN_BOTTOM_RIGHT, -14, -20);
+        lv_label_set_text(s_label_btn_retry, "Pesar por partes");
+        set_widget_visible(s_btn_retry, true);
+    }
+
     set_widget_visible(s_btn_cancel, true);
     bsp_display_unlock();
 }
@@ -841,30 +942,141 @@ void ui_update_wait_weight_live(float unidades_nuevas, float unidades_usadas, bo
     bsp_display_unlock();
 }
 
-void ui_show_wait_tare(void)
+/* Parte comun de las dos pantallas de tara (alta de material y pesada por
+ * partes): solo cambian el titulo y la instruccion. */
+static void show_tare_screen(const char *titulo, const char *instruccion)
 {
+    s_tare_instruccion = instruccion;
+
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%s\nPulse Confirmar cuando este listo.\n\nEsperando primera lectura...",
+             instruccion);
+
     bsp_display_lock(0);
     hide_interactive_widgets();
-    set_title("Peso de tara (material nuevo)");
-    lv_label_set_text(s_label_detail,
-        "Vacie la caja (retire todos los utiles).\n"
-        "Pulse Confirmar cuando este listo.\n\n"
-        "Esperando primera lectura...");
+    set_title(titulo);
+    lv_label_set_text(s_label_detail, buf);
     set_widget_visible(s_btn_confirm, true);
     set_widget_visible(s_btn_cancel, true);
     bsp_display_unlock();
 }
 
+void ui_show_wait_tare(void)
+{
+    show_tare_screen("Peso de tara (material nuevo)", "Vacie la caja (retire todos los utiles).");
+}
+
+void ui_show_partial_tare(void)
+{
+    show_tare_screen("Tara del recipiente", "Coloque VACIO el recipiente que usara para las tandas.");
+}
+
 void ui_update_wait_tare_reading(float weight_g)
 {
-    char buf[160];
+    char buf[220];
     snprintf(buf, sizeof(buf),
-             "Vacie la caja (retire todos los utiles).\n"
-             "Pulse Confirmar cuando este listo.\n\n"
-             "Ultimo peso leido: %.1f g", weight_g);
+             "%s\nPulse Confirmar cuando este listo.\n\nUltimo peso leido: %.1f g",
+             s_tare_instruccion, weight_g);
 
     bsp_display_lock(0);
     lv_label_set_text(s_label_detail, buf);
+    bsp_display_unlock();
+}
+
+void ui_show_partial_count(const char *descripcion, bool tiene_referencia,
+                            int referencia_nuevas, int referencia_usadas)
+{
+    char titulo[80];
+    sanitize_for_display(descripcion, titulo, sizeof(titulo));
+
+    s_referencia_activa = tiene_referencia;
+    s_referencia_nuevas = referencia_nuevas;
+    s_referencia_usadas = referencia_usadas;
+
+    bsp_display_lock(0);
+    hide_interactive_widgets();
+
+    /* Titulo mas pequeno y pegado al margen (dejando hueco al LED) que en
+     * el resto de pantallas: aqui hay dos filas de botones y tres columnas
+     * de numeros, y la descripcion no debe comerse ese espacio. */
+    lv_obj_set_width(s_label_title, 380);
+    lv_obj_set_style_text_font(s_label_title, &lv_font_montserrat_20, 0);
+    lv_obj_align(s_label_title, LV_ALIGN_TOP_LEFT, 50, 10);
+    set_title(titulo);
+    set_widget_visible(s_label_detail, false);
+
+    lv_led_set_color(s_led_stable, lv_palette_main(LV_PALETTE_GREY));
+    lv_led_on(s_led_stable);
+    set_widget_visible(s_led_stable, true);
+
+    lv_label_set_text(s_partial_value_tanda, "--");
+    lv_label_set_text(s_partial_value_nuevas, "0");
+    lv_label_set_text(s_partial_value_usadas, "0");
+    lv_label_set_text(s_partial_hint_tanda, "");
+    /* Igual que en ui_show_wait_weight_used(): color y diferencias se
+     * resetean aqui para que no se queden pegados los del articulo anterior. */
+    lv_obj_set_style_text_color(s_partial_value_tanda, lv_color_hex(0x202632), 0);
+    lv_label_set_text(s_partial_diff_nuevas, "");
+    lv_label_set_text(s_partial_diff_usadas, "");
+    set_widget_visible(s_cont_partial, true);
+
+    set_widget_visible(s_btn_partial_nuevas, true);
+    set_widget_visible(s_btn_partial_usadas, true);
+
+    lv_obj_set_size(s_btn_retry, 146, 44);
+    lv_obj_align(s_btn_retry, LV_ALIGN_BOTTOM_LEFT, 10, -8);
+    lv_obj_set_size(s_btn_confirm, 146, 44);
+    lv_obj_align(s_btn_confirm, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_size(s_btn_cancel, 146, 44);
+    lv_obj_align(s_btn_cancel, LV_ALIGN_BOTTOM_RIGHT, -10, -8);
+    lv_label_set_text(s_label_btn_retry, "Deshacer");
+    lv_label_set_text(s_label_btn_confirm, "Finalizar");
+    set_widget_visible(s_btn_retry, true);
+    set_widget_visible(s_btn_confirm, true);
+    set_widget_visible(s_btn_cancel, true);
+
+    bsp_display_unlock();
+}
+
+void ui_update_partial_count(int nuevas, int usadas, float tanda_uds,
+                              ui_partial_hint_t hint, bool stable,
+                              bool peso_unitario_sospechoso)
+{
+    char tanda_buf[12];
+    if (hint == UI_PARTIAL_HINT_EMPTY_CONTAINER) {
+        strlcpy(tanda_buf, "--", sizeof(tanda_buf));
+    } else {
+        snprintf(tanda_buf, sizeof(tanda_buf), "%.1f", tanda_uds);
+    }
+
+    char nuevas_buf[12];
+    snprintf(nuevas_buf, sizeof(nuevas_buf), "%d", nuevas);
+    char usadas_buf[12];
+    snprintf(usadas_buf, sizeof(usadas_buf), "%d", usadas);
+
+    const char *hint_text = "";
+    if (hint == UI_PARTIAL_HINT_EMPTY_CONTAINER) {
+        hint_text = "Vacie el recipiente";
+    } else if (hint == UI_PARTIAL_HINT_WAITING_STABLE) {
+        hint_text = "Esperando estable...";
+    }
+
+    /* Mismo aviso que en la pesada normal: naranja si la tanda se aleja
+     * demasiado de un numero entero (peso_unitario sospechoso). Sin valor
+     * mostrado no hay nada que avisar. */
+    lv_color_t color = (peso_unitario_sospechoso && hint != UI_PARTIAL_HINT_EMPTY_CONTAINER)
+        ? lv_palette_main(LV_PALETTE_ORANGE)
+        : lv_color_hex(0x202632);
+
+    bsp_display_lock(0);
+    lv_label_set_text(s_partial_value_tanda, tanda_buf);
+    lv_obj_set_style_text_color(s_partial_value_tanda, color, 0);
+    lv_label_set_text(s_partial_value_nuevas, nuevas_buf);
+    lv_label_set_text(s_partial_value_usadas, usadas_buf);
+    lv_label_set_text(s_partial_hint_tanda, hint_text);
+    update_diff_label(s_partial_diff_nuevas, (float)nuevas, s_referencia_nuevas);
+    update_diff_label(s_partial_diff_usadas, (float)usadas, s_referencia_usadas);
+    lv_led_set_color(s_led_stable, stable ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_RED));
     bsp_display_unlock();
 }
 

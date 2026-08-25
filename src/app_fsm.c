@@ -65,12 +65,29 @@ typedef enum {
     APP_STATE_REG_ENTER_CALIBRE,     /* teclado decimal: calibre */
     APP_STATE_REG_ENTER_CABEZA,      /* teclado decimal: cabeza */
 
+    /* Pesada por partes: para cajas que superan el maximo de la bascula, se
+     * van pesando tandas sueltas y clasificandolas a mano (ver
+     * handle_partial_mode_pressed()). Solo para articulos ya catalogados:
+     * hace falta el peso_unitario de datos_maestros para convertir el peso
+     * de cada tanda en unidades. */
+    APP_STATE_PARTIAL_WAIT_TARE, /* pesando el recipiente vacio que se usara para las tandas */
+    APP_STATE_PARTIAL_COUNT,     /* contando tandas con los botones NUEVAS/USADAS */
+
     /* Menu de ajustes (solo accesible desde reposo) */
     APP_STATE_SETTINGS_LIST,          /* lista de los 8 ajustes */
     APP_STATE_SETTINGS_EXPLAIN,       /* descripcion/rango de un ajuste, antes de editarlo */
     APP_STATE_SETTINGS_EDIT,          /* teclado, editando el ajuste seleccionado */
     APP_STATE_SETTINGS_RESET_CONFIRM, /* confirmacion de "Restablecer valores de fabrica" */
 } app_state_t;
+
+/* Boton de clasificar pulsado en la pesada por partes mientras el peso aun
+ * no estaba estable: se recuerda y la tanda se registra sola en cuanto
+ * llegue el peso estable (ver handle_partial_button()). */
+typedef enum {
+    PARCIAL_PENDIENTE_NINGUNA,
+    PARCIAL_PENDIENTE_NUEVAS,
+    PARCIAL_PENDIENTE_USADAS,
+} parcial_pendiente_t;
 
 typedef struct {
     char codigo[MASTER_CODIGO_MAX_LEN];
@@ -117,6 +134,20 @@ typedef struct {
     bool tiene_referencia;
     int referencia_nuevas;
     int referencia_usadas;
+
+    /* Pesada por partes (APP_STATE_PARTIAL_*) */
+    int parcial_nuevas;             /* acumulado de tandas clasificadas como nuevas */
+    int parcial_usadas;             /* idem, usadas */
+    float parcial_tara_g;           /* tara del recipiente, medida al entrar en el flujo */
+    float parcial_peso_tanda_g;     /* ultimo peso estable leido (bruto, sin restar tara) */
+    bool parcial_tanda_lista;       /* ese peso estable corresponde a una tanda aun sin registrar */
+    bool parcial_esperando_vaciado; /* tanda ya registrada: no se admite otra hasta vaciar el recipiente */
+    parcial_pendiente_t parcial_pendiente; /* NUEVAS/USADAS pulsado sin peso estable todavia */
+    /* Ultima tanda registrada, para Deshacer (un solo nivel) */
+    bool parcial_hay_ultima;
+    int parcial_ultima_uds;
+    bool parcial_ultima_era_nuevas;
+    float parcial_ultima_peso_g;
 } process_ctx_t;
 
 static app_state_t s_state = APP_STATE_IDLE;
@@ -152,6 +183,9 @@ static void finish_master_update(void);
 static void finish_master_completion(void);
 static void link_tag_and_proceed(const master_item_t *existing);
 static void route_existing_articulo(const master_item_t *existing);
+static void partial_refresh_ui(void);
+static void partial_live_update(float weight_g, bool stable);
+static void partial_register_batch(bool es_nuevas);
 
 /* Busca el stock teorico de s_ctx.codigo en inventario_referencia.csv (si
  * el fichero existe y el codigo figura en el) y muestra la pantalla de
@@ -167,6 +201,20 @@ static void show_wait_weight_used(void)
 
     ui_show_wait_weight_used(s_ctx.descripcion, s_ctx.unidades_totales, s_ctx.peso_total_g,
                               s_ctx.tiene_referencia, s_ctx.referencia_nuevas, s_ctx.referencia_usadas);
+}
+
+/* Igual que show_wait_weight_used(), pero para la pantalla de recuento por
+ * tandas: mismo asistente opcional de stock teorico, comparado esta vez
+ * contra los acumulados que se van sumando. */
+static void show_partial_count(void)
+{
+    const referencia_item_t *ref = csv_referencia_find_by_codigo(s_ctx.codigo);
+    s_ctx.tiene_referencia = (ref != NULL);
+    s_ctx.referencia_nuevas = ref ? ref->unidades_nuevas : 0;
+    s_ctx.referencia_usadas = ref ? ref->unidades_usadas : 0;
+
+    ui_show_partial_count(s_ctx.descripcion, s_ctx.tiene_referencia,
+                           s_ctx.referencia_nuevas, s_ctx.referencia_usadas);
 }
 
 /* Arma la pesada aplicando el filtro de peso minimo solo cuando el estado
@@ -261,7 +309,7 @@ static void handle_nfc_tag(const char *uid_hex)
         strlcpy(s_ctx.reg_uid, uid_hex, sizeof(s_ctx.reg_uid));
 
         s_state = APP_STATE_REG_WAIT_WEIGHT_TOTAL;
-        ui_show_description_and_wait_weight(MSG_REG_WEIGH_TOTAL);
+        ui_show_description_and_wait_weight(MSG_REG_WEIGH_TOTAL, false);
         start_weighing_for_state(s_state);
         return;
     }
@@ -286,7 +334,7 @@ static void handle_nfc_tag(const char *uid_hex)
     s_ctx.peso_unitario = item->peso_unitario;
 
     s_state = APP_STATE_WAIT_WEIGHT_TOTAL;
-    ui_show_description_and_wait_weight(s_ctx.descripcion);
+    ui_show_description_and_wait_weight(s_ctx.descripcion, true);
     start_weighing_for_state(s_state);
 }
 
@@ -334,7 +382,7 @@ static void handle_update_master_pressed(void)
     s_ctx.tiene_lectura_usados = false;
 
     s_state = APP_STATE_REG_WAIT_WEIGHT_TOTAL;
-    ui_show_description_and_wait_weight(MSG_UPDATE_WEIGH_TOTAL);
+    ui_show_description_and_wait_weight(MSG_UPDATE_WEIGH_TOTAL, false);
     start_weighing_for_state(s_state);
 }
 
@@ -524,6 +572,7 @@ static void handle_scale_stable(float weight_g)
         break;
 
     case APP_STATE_REG_WAIT_TARE:
+    case APP_STATE_PARTIAL_WAIT_TARE:
         /* Igual que WAIT_WEIGHT_USED: vigilancia en segundo plano sin
          * avanzar de estado, para dar tiempo real a vaciar la caja en vez
          * de aceptar el primer peso estable (que normalmente es aun el de
@@ -531,7 +580,31 @@ static void handle_scale_stable(float weight_g)
         s_ctx.pending_weight_g = weight_g;
         s_ctx.tiene_lectura_tara = true;
         ui_update_wait_tare_reading(weight_g);
-        continue_weighing_for_state(APP_STATE_REG_WAIT_TARE);
+        continue_weighing_for_state(s_state);
+        break;
+
+    case APP_STATE_PARTIAL_COUNT:
+        if (s_ctx.parcial_esperando_vaciado) {
+            /* La tanda anterior ya esta contada: solo se mira si el
+             * recipiente ha vuelto a estar vacio (o se ha retirado de la
+             * bascula, que da un neto muy negativo) para admitir la
+             * siguiente. */
+            if ((weight_g - s_ctx.parcial_tara_g) <= settings_get(SETTING_SCALE_ZERO_THRESHOLD_G)) {
+                s_ctx.parcial_esperando_vaciado = false;
+                partial_refresh_ui();
+            }
+        } else {
+            s_ctx.parcial_peso_tanda_g = weight_g;
+            s_ctx.parcial_tanda_lista = true;
+            if (s_ctx.parcial_pendiente != PARCIAL_PENDIENTE_NINGUNA) {
+                /* NUEVAS/USADAS se pulso antes de que el peso estuviera
+                 * estable: ya lo esta, se registra ahora. */
+                partial_register_batch(s_ctx.parcial_pendiente == PARCIAL_PENDIENTE_NUEVAS);
+            } else {
+                partial_refresh_ui();
+            }
+        }
+        continue_weighing_for_state(APP_STATE_PARTIAL_COUNT);
         break;
 
     default:
@@ -547,6 +620,11 @@ static void handle_scale_stable(float weight_g)
  * inventario cuadra. */
 static void handle_scale_reading(float weight_g, bool stable)
 {
+    if (s_state == APP_STATE_PARTIAL_COUNT) {
+        partial_live_update(weight_g, stable);
+        return;
+    }
+
     if (s_state != APP_STATE_WAIT_WEIGHT_USED) {
         return;
     }
@@ -571,7 +649,8 @@ static void handle_scale_reading(float weight_g, bool stable)
 
 static void handle_scale_timeout(void)
 {
-    if (s_state == APP_STATE_WAIT_WEIGHT_USED || s_state == APP_STATE_REG_WAIT_TARE) {
+    if (s_state == APP_STATE_WAIT_WEIGHT_USED || s_state == APP_STATE_REG_WAIT_TARE ||
+        s_state == APP_STATE_PARTIAL_WAIT_TARE || s_state == APP_STATE_PARTIAL_COUNT) {
         /* No interrumpir al operario mientras retira utiles/vacia la caja
          * en varias tandas: se sigue vigilando en segundo plano sin
          * mostrar error. */
@@ -587,22 +666,11 @@ static void handle_scale_timeout(void)
     }
 }
 
-/* Calcula unidades usadas/nuevas a partir del peso ya confirmado por el
- * operario y guarda el resultado en inventario.csv. */
-static void finish_used_weighing(float weight_g)
+/* Guarda el recuento en inventario.csv, lo confirma en pantalla y vuelve a
+ * reposo. Comun a los dos finales posibles: la pesada normal (caja entera,
+ * finish_used_weighing) y el recuento por tandas (finish_partial_counting). */
+static void save_inventory_and_finish(int unidades_nuevas, int unidades_usadas)
 {
-    scale_cancel_weighing(); /* dejar de vigilar en segundo plano */
-
-    int unidades_usadas = units_from_weight(weight_g);
-    ESP_LOGI(TAG, "Unidades usadas (confirmado por operario): %d", unidades_usadas);
-
-    if (unidades_usadas > s_ctx.unidades_totales) {
-        s_state = APP_STATE_INCONSISTENT_WEIGHT;
-        ui_show_inconsistent_weight();
-        return;
-    }
-
-    int unidades_nuevas = s_ctx.unidades_totales - unidades_usadas;
     if (s_ctx.overwrite_duplicate) {
         /* Sobrescribir un codigo ya registrado obliga a reescribir
          * inventario.csv entero; con el fichero ya crecido eso bloquea la
@@ -626,13 +694,235 @@ static void finish_used_weighing(float weight_g)
     go_idle();
 }
 
+/* Calcula unidades usadas/nuevas a partir del peso ya confirmado por el
+ * operario y guarda el resultado en inventario.csv. */
+static void finish_used_weighing(float weight_g)
+{
+    scale_cancel_weighing(); /* dejar de vigilar en segundo plano */
+
+    int unidades_usadas = units_from_weight(weight_g);
+    ESP_LOGI(TAG, "Unidades usadas (confirmado por operario): %d", unidades_usadas);
+
+    if (unidades_usadas > s_ctx.unidades_totales) {
+        s_state = APP_STATE_INCONSISTENT_WEIGHT;
+        ui_show_inconsistent_weight();
+        return;
+    }
+
+    save_inventory_and_finish(s_ctx.unidades_totales - unidades_usadas, unidades_usadas);
+}
+
+/* ---- Pesada por partes -------------------------------------------------
+ *
+ * Para cajas que pesan mas de lo que admite la bascula: en vez de una sola
+ * pesada de la caja entera, se van pesando tandas sueltas en un recipiente
+ * (cuya tara se mide al entrar) y se clasifica cada una con NUEVAS/USADAS.
+ * El total del articulo acaba siendo la suma de las tandas, no una lectura
+ * unica, asi que aqui no hay comprobacion de "usadas > totales" que hacer:
+ * el total ES nuevas+usadas por construccion.
+ */
+
+/* Unidades de la tanda que hay ahora mismo en el recipiente. Como la tara
+ * es la del recipiente de tandas (medida en este flujo), no la de la caja
+ * del articulo, no se puede usar units_from_weight(). */
+static float partial_units_f(float peso_bruto_g)
+{
+    float peso_neto = peso_bruto_g - s_ctx.parcial_tara_g;
+    if (peso_neto < 0.0f) {
+        peso_neto = 0.0f;
+    }
+    if (s_ctx.peso_unitario <= 0.0f) {
+        return 0.0f;
+    }
+    return peso_neto / s_ctx.peso_unitario;
+}
+
+static ui_partial_hint_t partial_current_hint(void)
+{
+    if (s_ctx.parcial_esperando_vaciado) {
+        return UI_PARTIAL_HINT_EMPTY_CONTAINER;
+    }
+    if (s_ctx.parcial_pendiente != PARCIAL_PENDIENTE_NINGUNA) {
+        return UI_PARTIAL_HINT_WAITING_STABLE;
+    }
+    return UI_PARTIAL_HINT_NONE;
+}
+
+/* Mismo aviso que en la pesada normal: cuanto se aleja la cuenta de un
+ * numero entero, es decir, si el peso_unitario guardado cuadra o no. */
+static bool partial_unit_weight_suspicious(float unidades_f)
+{
+    return fabsf(unidades_f - roundf(unidades_f)) >
+           (settings_get(SETTING_UNIT_ROUNDING_TOLERANCE_PCT) / 100.0f);
+}
+
+/* Repinta los numeros de la pantalla de tandas tras un cambio de estado
+ * (tanda registrada, deshecha, recipiente vaciado...). El refresco continuo
+ * mientras el peso se mueve lo hace partial_live_update(). */
+static void partial_refresh_ui(void)
+{
+    float tanda_f = s_ctx.parcial_tanda_lista ? partial_units_f(s_ctx.parcial_peso_tanda_g) : 0.0f;
+    ui_update_partial_count(s_ctx.parcial_nuevas, s_ctx.parcial_usadas, tanda_f,
+                             partial_current_hint(), s_ctx.parcial_tanda_lista,
+                             s_ctx.parcial_tanda_lista && partial_unit_weight_suspicious(tanda_f));
+}
+
+/* Lectura "en vivo" (cada muestra, estable o no) mientras se cuentan
+ * tandas: numero de la tanda actual y LED, sin tocar los acumulados. */
+static void partial_live_update(float weight_g, bool stable)
+{
+    /* En cuanto la bascula se mueve, el ultimo peso estable deja de valer:
+     * si no se invalidara aqui, pulsar NUEVAS/USADAS justo despues de echar
+     * mas piezas registraria la tanda ANTERIOR (el ultimo valor estable) en
+     * vez de esperar a que se asiente la de ahora. */
+    if (!stable && !s_ctx.parcial_esperando_vaciado) {
+        s_ctx.parcial_tanda_lista = false;
+    }
+
+    float tanda_f = partial_units_f(weight_g);
+    ui_update_partial_count(s_ctx.parcial_nuevas, s_ctx.parcial_usadas, tanda_f,
+                             partial_current_hint(), stable,
+                             partial_unit_weight_suspicious(tanda_f));
+}
+
+/* Entrar en el flujo por partes desde la pantalla de peso total ("Pesar por
+ * partes"). Lo primero es la tara del recipiente: sin ella no se puede
+ * convertir el peso de ninguna tanda en unidades. */
+static void handle_partial_mode_pressed(void)
+{
+    scale_cancel_weighing();
+
+    s_ctx.parcial_nuevas = 0;
+    s_ctx.parcial_usadas = 0;
+    s_ctx.parcial_tara_g = 0.0f;
+    s_ctx.parcial_peso_tanda_g = 0.0f;
+    s_ctx.parcial_tanda_lista = false;
+    s_ctx.parcial_esperando_vaciado = false;
+    s_ctx.parcial_pendiente = PARCIAL_PENDIENTE_NINGUNA;
+    s_ctx.parcial_hay_ultima = false;
+    s_ctx.tiene_lectura_tara = false;
+
+    ESP_LOGI(TAG, "Pesada por partes para %s: pidiendo tara del recipiente", s_ctx.codigo);
+
+    s_state = APP_STATE_PARTIAL_WAIT_TARE;
+    ui_show_partial_tare();
+    start_weighing_for_state(s_state);
+}
+
+/* Pasa la tanda que hay en la bascula al contador correspondiente. Solo se
+ * llama con un peso estable ya medido (parcial_tanda_lista). */
+static void partial_register_batch(bool es_nuevas)
+{
+    int uds = (int)lroundf(partial_units_f(s_ctx.parcial_peso_tanda_g));
+
+    s_ctx.parcial_pendiente = PARCIAL_PENDIENTE_NINGUNA;
+
+    if (uds <= 0) {
+        /* Menos de media unidad en el recipiente: no hay nada que sumar, y
+         * registrar un 0 solo obligaria a vaciar para nada. */
+        ESP_LOGW(TAG, "Tanda ignorada: %.2f g dan 0 unidades", s_ctx.parcial_peso_tanda_g);
+        partial_refresh_ui();
+        return;
+    }
+
+    if (es_nuevas) {
+        s_ctx.parcial_nuevas += uds;
+    } else {
+        s_ctx.parcial_usadas += uds;
+    }
+
+    s_ctx.parcial_hay_ultima = true;
+    s_ctx.parcial_ultima_uds = uds;
+    s_ctx.parcial_ultima_era_nuevas = es_nuevas;
+    s_ctx.parcial_ultima_peso_g = s_ctx.parcial_peso_tanda_g;
+
+    /* Hasta que el recipiente se vacie, lo que marque la bascula sigue
+     * siendo esta misma tanda: no se admite otra (ni se muestra), para no
+     * contarla dos veces. */
+    s_ctx.parcial_esperando_vaciado = true;
+    s_ctx.parcial_tanda_lista = false;
+
+    ESP_LOGI(TAG, "Tanda registrada: %d uds como %s (acumulado %d nuevas / %d usadas)",
+             uds, es_nuevas ? "NUEVAS" : "USADAS", s_ctx.parcial_nuevas, s_ctx.parcial_usadas);
+
+    partial_refresh_ui();
+}
+
+/* Boton NUEVAS/USADAS. Si el peso aun no esta estable no se descarta la
+ * pulsacion: se recuerda y la tanda se registra sola en cuanto lo este. */
+static void handle_partial_button(bool es_nuevas)
+{
+    if (s_state != APP_STATE_PARTIAL_COUNT) {
+        return;
+    }
+
+    if (s_ctx.parcial_esperando_vaciado) {
+        ESP_LOGD(TAG, "Clasificacion ignorada: falta vaciar el recipiente");
+        return;
+    }
+
+    if (s_ctx.parcial_tanda_lista) {
+        partial_register_batch(es_nuevas);
+        return;
+    }
+
+    s_ctx.parcial_pendiente = es_nuevas ? PARCIAL_PENDIENTE_NUEVAS : PARCIAL_PENDIENTE_USADAS;
+    partial_refresh_ui();
+}
+
+/* Deshacer la ultima tanda (un solo nivel): resta del contador al que se
+ * sumo y deja el recipiente listo para volver a clasificarla, que es el
+ * caso real - pulsar NUEVAS cuando era USADAS y darse cuenta al momento,
+ * con la tanda todavia en la bascula. Si ya se habia vaciado, la siguiente
+ * lectura estable sustituira ese peso sin mas. */
+static void handle_partial_undo(void)
+{
+    if (!s_ctx.parcial_hay_ultima) {
+        return;
+    }
+
+    if (s_ctx.parcial_ultima_era_nuevas) {
+        s_ctx.parcial_nuevas -= s_ctx.parcial_ultima_uds;
+    } else {
+        s_ctx.parcial_usadas -= s_ctx.parcial_ultima_uds;
+    }
+
+    ESP_LOGI(TAG, "Deshecha la ultima tanda: %d uds de %s (acumulado %d nuevas / %d usadas)",
+             s_ctx.parcial_ultima_uds, s_ctx.parcial_ultima_era_nuevas ? "NUEVAS" : "USADAS",
+             s_ctx.parcial_nuevas, s_ctx.parcial_usadas);
+
+    s_ctx.parcial_peso_tanda_g = s_ctx.parcial_ultima_peso_g;
+    s_ctx.parcial_tanda_lista = true;
+    s_ctx.parcial_esperando_vaciado = false;
+    s_ctx.parcial_pendiente = PARCIAL_PENDIENTE_NINGUNA;
+    s_ctx.parcial_hay_ultima = false;
+
+    partial_refresh_ui();
+}
+
+/* "Finalizar": el total del articulo es la suma de las tandas contadas. */
+static void finish_partial_counting(void)
+{
+    if (s_ctx.parcial_nuevas == 0 && s_ctx.parcial_usadas == 0) {
+        /* Nada contado todavia: un toque accidental no debe dejar guardado
+         * un 0/0 que luego habria que corregir volviendo a pasar el tag. */
+        ESP_LOGD(TAG, "Finalizar ignorado: aun no se ha registrado ninguna tanda");
+        return;
+    }
+
+    scale_cancel_weighing();
+    ESP_LOGI(TAG, "Recuento por partes terminado: %d nuevas / %d usadas",
+             s_ctx.parcial_nuevas, s_ctx.parcial_usadas);
+    save_inventory_and_finish(s_ctx.parcial_nuevas, s_ctx.parcial_usadas);
+}
+
 static void handle_confirm_pressed(void)
 {
     switch (s_state) {
     case APP_STATE_DUPLICATE_CONFIRM:
         s_ctx.overwrite_duplicate = true;
         s_state = APP_STATE_WAIT_WEIGHT_TOTAL;
-        ui_show_description_and_wait_weight(s_ctx.descripcion);
+        ui_show_description_and_wait_weight(s_ctx.descripcion, true);
         start_weighing_for_state(s_state);
         break;
 
@@ -672,6 +962,21 @@ static void handle_confirm_pressed(void)
             break; /* aun no ha llegado ninguna lectura, se ignora el toque */
         }
         finish_used_weighing(s_ctx.pending_weight_g);
+        break;
+
+    case APP_STATE_PARTIAL_WAIT_TARE:
+        if (!s_ctx.tiene_lectura_tara) {
+            break; /* aun no ha llegado ninguna lectura, se ignora el toque */
+        }
+        s_ctx.parcial_tara_g = s_ctx.pending_weight_g;
+        ESP_LOGI(TAG, "Pesada por partes: tara del recipiente = %.2f g", s_ctx.parcial_tara_g);
+        s_state = APP_STATE_PARTIAL_COUNT;
+        show_partial_count();
+        start_weighing_for_state(s_state);
+        break;
+
+    case APP_STATE_PARTIAL_COUNT: /* "Finalizar" */
+        finish_partial_counting();
         break;
 
     case APP_STATE_REG_WAIT_TARE:
@@ -916,18 +1221,28 @@ static void handle_retry_pressed(void)
         /* La pesada de la caja completa no fue correcta: se repite desde
          * cero, reutilizando descripcion/tara/peso_unitario ya conocidos. */
         s_state = APP_STATE_WAIT_WEIGHT_TOTAL;
-        ui_show_description_and_wait_weight(s_ctx.descripcion);
+        ui_show_description_and_wait_weight(s_ctx.descripcion, true);
         start_weighing_for_state(s_state);
+        break;
+
+    case APP_STATE_WAIT_WEIGHT_TOTAL:
+        /* "Pesar por partes": la caja no cabe/pesa mas de lo que admite la
+         * bascula, se cuenta por tandas. */
+        handle_partial_mode_pressed();
+        break;
+
+    case APP_STATE_PARTIAL_COUNT: /* "Deshacer" */
+        handle_partial_undo();
         break;
 
     case APP_STATE_TIMEOUT_WEIGHT:
         s_state = s_ctx.pending_weight_state;
         switch (s_state) {
         case APP_STATE_WAIT_WEIGHT_TOTAL:
-            ui_show_description_and_wait_weight(s_ctx.descripcion);
+            ui_show_description_and_wait_weight(s_ctx.descripcion, true);
             break;
         case APP_STATE_REG_WAIT_WEIGHT_TOTAL:
-            ui_show_description_and_wait_weight(s_ctx.reg_is_update ? MSG_UPDATE_WEIGH_TOTAL : MSG_REG_WEIGH_TOTAL);
+            ui_show_description_and_wait_weight(s_ctx.reg_is_update ? MSG_UPDATE_WEIGH_TOTAL : MSG_REG_WEIGH_TOTAL, false);
             break;
         default:
             break;
@@ -941,7 +1256,7 @@ static void handle_retry_pressed(void)
         s_state = s_ctx.pending_weight_state;
         switch (s_state) {
         case APP_STATE_REG_WAIT_WEIGHT_TOTAL:
-            ui_show_description_and_wait_weight(s_ctx.reg_is_update ? MSG_UPDATE_WEIGH_TOTAL : MSG_REG_WEIGH_TOTAL);
+            ui_show_description_and_wait_weight(s_ctx.reg_is_update ? MSG_UPDATE_WEIGH_TOTAL : MSG_REG_WEIGH_TOTAL, false);
             break;
         default:
             break;
@@ -1041,6 +1356,8 @@ static void handle_cancel_pressed(void)
     case APP_STATE_REG_WAIT_TARE:
     case APP_STATE_REG_ENTER_CALIBRE:
     case APP_STATE_REG_ENTER_CABEZA:
+    case APP_STATE_PARTIAL_WAIT_TARE:
+    case APP_STATE_PARTIAL_COUNT:
     case APP_STATE_SETTINGS_LIST:
         go_idle();
         break;
@@ -1107,6 +1424,12 @@ static void app_task(void *arg)
             break;
         case APP_EVT_UI_SETTINGS_RESET_PRESSED:
             handle_settings_reset_pressed();
+            break;
+        case APP_EVT_UI_PARTIAL_NUEVAS_PRESSED:
+            handle_partial_button(true);
+            break;
+        case APP_EVT_UI_PARTIAL_USADAS_PRESSED:
+            handle_partial_button(false);
             break;
         }
     }

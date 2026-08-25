@@ -82,8 +82,16 @@ void ui_show_confirm_articulo(const char *codigo, const char *descripcion);
  */
 void ui_show_saving(void);
 
-/** Muestra la descripción del artículo y pide colocarlo en la báscula. */
-void ui_show_description_and_wait_weight(const char *descripcion);
+/**
+ * @brief Muestra la descripción del artículo y pide colocarlo en la báscula.
+ *
+ * @param permitir_por_partes Si true, junto a Cancelar aparece "Pesar por
+ * partes" (dispara APP_EVT_UI_RETRY_PRESSED), para cajas que superan el
+ * máximo de la báscula. Solo tiene sentido con artículos ya catalogados: el
+ * recuento por tandas necesita el peso_unitario de datos_maestros, que en un
+ * alta de material nuevo todavía no se conoce.
+ */
+void ui_show_description_and_wait_weight(const char *descripcion, bool permitir_por_partes);
 
 /**
  * @brief Pide retirar los útiles nuevos. LED de estable/inestable en la
@@ -135,10 +143,57 @@ void ui_update_wait_weight_live(float unidades_nuevas, float unidades_usadas, bo
 void ui_show_wait_tare(void);
 
 /**
+ * @brief Igual que ui_show_wait_tare(), pero para la pesada por partes: lo
+ * que se pesa aquí es el recipiente que se usará para ir contando tandas
+ * (puede ser la propia caja o cualquier otro), no la caja del artículo.
+ */
+void ui_show_partial_tare(void);
+
+/**
  * @brief Actualiza solo el texto de la última lectura de peso mostrada en
- * la pantalla de ui_show_wait_tare(), sin tocar los botones.
+ * la pantalla de tara, sin tocar los botones. Sirve para las dos variantes
+ * (ui_show_wait_tare() y ui_show_partial_tare()): reutiliza la instrucción
+ * que dejó puesta la que se mostró por última vez.
  */
 void ui_update_wait_tare_reading(float weight_g);
+
+/** Aviso bajo el número de la tanda actual en ui_show_partial_count(). */
+typedef enum {
+    UI_PARTIAL_HINT_NONE,
+    UI_PARTIAL_HINT_EMPTY_CONTAINER, /* tanda ya registrada: hay que vaciar antes de la siguiente */
+    UI_PARTIAL_HINT_WAITING_STABLE,  /* NUEVAS/USADAS pulsado, esperando a que el peso se estabilice */
+} ui_partial_hint_t;
+
+/**
+ * @brief Pantalla de recuento por tandas, para cajas que superan el máximo
+ * de la báscula: se van pesando puñados y clasificándolos con los botones
+ * NUEVAS/USADAS, que suman a sus contadores.
+ *
+ * Tres columnas: tanda actual (en vivo, con un decimal, igual que en
+ * ui_show_wait_weight_used() y por el mismo motivo) y los dos acumulados.
+ * Cinco botones: NUEVAS y USADAS (acción principal, grandes), y debajo
+ * Deshacer (APP_EVT_UI_RETRY_PRESSED, resta la última tanda), Finalizar
+ * (APP_EVT_UI_CONFIRM_PRESSED, guarda en inventario.csv) y Cancelar.
+ *
+ * Los parámetros de referencia funcionan igual que en
+ * ui_show_wait_weight_used(): con fila en inventario_referencia.csv se
+ * muestra la diferencia contra el teórico bajo cada acumulado.
+ */
+void ui_show_partial_count(const char *descripcion, bool tiene_referencia,
+                            int referencia_nuevas, int referencia_usadas);
+
+/**
+ * @brief Refresca los números de ui_show_partial_count(): acumulados, tanda
+ * actual y LED de estable/inestable.
+ *
+ * Con @p hint = UI_PARTIAL_HINT_EMPTY_CONTAINER la tanda actual se muestra
+ * como "--" en vez de su valor: la tanda ya se ha registrado y lo que siga
+ * marcando la báscula hasta que se vacíe el recipiente no es una tanda
+ * nueva, así que enseñarlo solo invitaría a contarla dos veces.
+ */
+void ui_update_partial_count(int nuevas, int usadas, float tanda_uds,
+                              ui_partial_hint_t hint, bool stable,
+                              bool peso_unitario_sospechoso);
 
 /** Peso usados > peso total: no se ha guardado nada, se puede reintentar
  *  la segunda pesada. */
