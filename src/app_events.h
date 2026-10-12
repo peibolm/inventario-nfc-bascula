@@ -67,7 +67,12 @@ extern QueueHandle_t g_app_event_queue;
  */
 void app_events_init(void);
 
-/** Envío no bloqueante; descarta el evento (con log) si la cola está llena. */
+/** Envío no bloqueante; descarta el evento (con log) si la cola está llena.
+ *
+ *  Las lecturas en vivo (APP_EVT_SCALE_READING) ceden el paso: se descartan
+ *  (sin log) si ya hay varios eventos esperando, porque son solo feedback
+ *  de pantalla y la siguiente llega en milisegundos. Así una ráfaga de
+ *  muestras de la báscula no puede desalojar a un APP_EVT_SCALE_STABLE. */
 void app_events_post(const app_event_t *event);
 
 #ifdef __cplusplus

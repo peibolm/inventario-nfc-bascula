@@ -15,6 +15,10 @@ static const char *TAG = "scale_task";
 
 #define SCALE_BAUD_RATE 9600 /* confirmado con la báscula real: 9600 8N1 */
 
+/* Tope de espera de cada lectura de trama. No es un periodo de muestreo
+ * real: si la bascula ya ha dejado tramas en el buffer, scale_uart_read_frame()
+ * vuelve sin esperar, asi que la tarea va al ritmo al que transmita la
+ * bascula. Solo acota cuanto se bloquea cuando no llega nada. */
 #define SCALE_SAMPLE_PERIOD_MS       200
 
 /* Tolerancia, ventana de estabilidad y timeout son ajustables en vivo desde
@@ -27,16 +31,21 @@ static const char *TAG = "scale_task";
 
 static volatile bool s_weighing_active = false;
 static volatile float s_min_weight_g = 0.0f;
-static volatile bool s_reset_window = false;
+
+/* Pesada nueva: vaciar la UART y empezar la ventana de cero. */
+static volatile bool s_restart_window = false;
+/* Volver a contar el timeout desde ahora, conservando la ventana. */
+static volatile bool s_restart_clock = false;
 
 void scale_request_weighing(float min_weight_g)
 {
-    /* La bascula transmite en continuo aunque nadie la lea (p.ej. mientras
-     * el operario teclea en el numpad); sin este flush, las primeras
-     * muestras de esta pesada podrian ser tramas viejas ya acumuladas. */
-    scale_uart_flush();
     s_min_weight_g = min_weight_g;
-    s_reset_window = true;
+    /* El flush lo hace la propia tarea al ver s_restart_window, no se llama
+     * aqui a scale_uart_flush(): la tarea lee la UART continuamente, asi
+     * que vaciarla desde otra tarea podria pillarla a mitad de montar una
+     * trama y dejar s_frame_buf a medias. */
+    s_restart_window = true;
+    s_restart_clock = true;
     s_weighing_active = true;
 }
 
@@ -46,8 +55,18 @@ void scale_continue_weighing(float min_weight_g)
      * acumuladas. Si cada re-armado de la vigilancia en segundo plano
      * reiniciase la ventana desde cero, el indicador de estable pasaria
      * brevemente por "inestable" en cada ciclo aunque el peso real no
-     * haya cambiado nada (parpadeo rojo/verde). */
+     * haya cambiado nada (parpadeo rojo/verde).
+     *
+     * El reloj del timeout SI se reinicia: cada re-armado es una espera
+     * nueva. Sin esto, como la ventana no vuelve a estar vacia nunca, el
+     * reloj solo avanzaba con lecturas estables; en cuanto el operario
+     * pasaba mas de SETTING_SCALE_STABILIZE_TIMEOUT_S moviendo peso (lo
+     * normal contando tandas: vaciar el recipiente, echar la siguiente),
+     * saltaba el timeout, app_fsm re-armaba, y la condicion seguia siendo
+     * cierta en la iteracion siguiente -> un timeout por muestra, en
+     * bucle, hasta que el peso volviera a asentarse. */
     s_min_weight_g = min_weight_g;
+    s_restart_clock = true;
     s_weighing_active = true;
 }
 
@@ -61,21 +80,34 @@ static void scale_poll_task(void *arg)
     float window[SCALE_STABLE_WINDOW_SAMPLES_MAX];
     size_t window_count = 0;
     size_t window_size = SCALE_STABLE_WINDOW_SAMPLES_MAX;
-    TickType_t weighing_start = 0;
+    TickType_t weighing_start = xTaskGetTickCount();
 
     while (1) {
-        if (!s_weighing_active) {
-            vTaskDelay(pdMS_TO_TICKS(SCALE_SAMPLE_PERIOD_MS));
-            continue;
-        }
+        /* La UART se lee SIEMPRE, haya pesada en curso o no.
+         *
+         * Antes la tarea dormia 200ms cuando no habia pesada activa, y eso
+         * incluye el hueco entre publicar APP_EVT_SCALE_STABLE/TIMEOUT (que
+         * ponen s_weighing_active a false) y el re-armado desde app_fsm. La
+         * bascula transmite en continuo, asi que durante ese hueco las
+         * tramas se acumulaban en el driver; al reanudar,
+         * scale_uart_read_frame() las devolvia de golpe y sin esperar
+         * (vuelve en cuanto hay un '\n' en el buffer), y la ventana acababa
+         * mezclando pesos de instantes distintos. Con el peso quieto no se
+         * nota -las tramas atrasadas valen lo mismo que la actual-, pero
+         * contando tandas, donde el peso cambia mientras se echan piezas,
+         * hacia que max-min no bajase nunca de la tolerancia: la bascula
+         * estaba quieta y aun asi no estabilizaba nunca. */
+        uint8_t frame[64];
+        size_t n = scale_uart_read_frame(frame, sizeof(frame), SCALE_SAMPLE_PERIOD_MS);
 
-        if (s_reset_window) {
-            s_reset_window = false;
+        if (s_restart_window) {
+            s_restart_window = false;
+            scale_uart_flush();
+            n = 0; /* lo que se acaba de leer es anterior al flush */
             window_count = 0;
         }
 
         if (window_count == 0) {
-            weighing_start = xTaskGetTickCount();
             /* El tamano de ventana se fija solo al arrancar una pesada
              * nueva, no en mitad de una: si cambiase a media ventana, las
              * muestras ya acumuladas dejarian de tener sentido. */
@@ -88,12 +120,18 @@ static void scale_poll_task(void *arg)
             window_size = (size_t)configured;
         }
 
-        uint8_t frame[64];
-        size_t n = scale_uart_read_frame(frame, sizeof(frame), SCALE_SAMPLE_PERIOD_MS);
-        float weight_g;
+        if (s_restart_clock) {
+            s_restart_clock = false;
+            weighing_start = xTaskGetTickCount();
+        }
 
-        if (n > 0 && scale_protocol_parse(frame, n, &weight_g) &&
-            fabsf(weight_g) >= s_min_weight_g) {
+        float weight_g = 0.0f;
+        bool have_sample = (n > 0 && scale_protocol_parse(frame, n, &weight_g) &&
+                            fabsf(weight_g) >= s_min_weight_g);
+        bool is_stable = false;
+        float avg = weight_g;
+
+        if (have_sample) {
             if (window_count < window_size) {
                 window[window_count++] = weight_g;
             } else {
@@ -101,8 +139,6 @@ static void scale_poll_task(void *arg)
                 window[window_size - 1] = weight_g;
             }
 
-            bool is_stable = false;
-            float avg = weight_g;
             if (window_count == window_size) {
                 float min_w = window[0], max_w = window[0], sum = 0.0f;
                 for (size_t i = 0; i < window_size; i++) {
@@ -113,7 +149,16 @@ static void scale_poll_task(void *arg)
                 is_stable = (max_w - min_w) <= settings_get(SETTING_SCALE_WEIGHT_TOLERANCE_G);
                 avg = sum / window_size;
             }
+        }
 
+        /* Hasta aqui se trabaja igual con pesada o sin ella: lo unico que
+         * cambia es que sin pesada activa no se publica nada. Asi la
+         * ventana llega siempre al dia al siguiente re-armado. */
+        if (!s_weighing_active) {
+            continue;
+        }
+
+        if (have_sample) {
             /* Lectura "en vivo" para dar feedback continuo en pantalla
              * (peso actual + si esta estable o aun asentandose), tanto si
              * la ventana ya esta completa/estable como si no. */
@@ -124,13 +169,6 @@ static void scale_poll_task(void *arg)
 
             if (is_stable) {
                 ESP_LOGI(TAG, "Peso estable: %.1f g", avg);
-
-                /* Se refresca el reloj del timeout aqui (no solo cuando la
-                 * ventana arranca de cero) porque en modo "continue" la
-                 * ventana ya no se reinicia entre re-armados: sin esto, el
-                 * timeout de 15s se mediria desde un arranque muy antiguo
-                 * durante una vigilancia larga. */
-                weighing_start = xTaskGetTickCount();
 
                 /* Importante: dejar nuestro propio estado en "terminado"
                  * ANTES de publicar el evento. app_events_post() puede
@@ -149,7 +187,10 @@ static void scale_poll_task(void *arg)
         }
 
         uint32_t timeout_ms = (uint32_t)(settings_get(SETTING_SCALE_STABILIZE_TIMEOUT_S) * 1000.0f);
-        if (s_weighing_active &&
+        /* s_restart_clock pendiente = app_fsm acaba de re-armar en mitad de
+         * esta iteracion; el reloj se pondra a cero al principio de la
+         * siguiente, asi que no tiene sentido medir contra el viejo. */
+        if (s_weighing_active && !s_restart_clock &&
             (xTaskGetTickCount() - weighing_start) > pdMS_TO_TICKS(timeout_ms)) {
             ESP_LOGW(TAG, "Timeout esperando peso estable");
             s_weighing_active = false;

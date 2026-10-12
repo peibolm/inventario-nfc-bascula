@@ -29,11 +29,14 @@ void scale_request_weighing(float min_weight_g);
 /**
  * @brief Igual que scale_request_weighing(), pero sin vaciar el buffer de
  * UART ni reiniciar la ventana de muestras ya acumulada: la usa la propia
- * vigilancia en segundo plano (WAIT_WEIGHT_USED, REG_WAIT_TARE) para
- * volver a armarse tras cada lectura sin perder la ventana ya estable (si
- * no, el indicador de estable parpadearia en cada re-armado aunque el peso
- * real no cambie). Usar scale_request_weighing() en vez de esta para
- * arrancar una pesada realmente nueva.
+ * vigilancia en segundo plano (WAIT_WEIGHT_USED, REG_WAIT_TARE,
+ * PARTIAL_COUNT) para volver a armarse tras cada lectura sin perder la
+ * ventana ya estable (si no, el indicador de estable parpadearia en cada
+ * re-armado aunque el peso real no cambie). Usar scale_request_weighing()
+ * en vez de esta para arrancar una pesada realmente nueva.
+ *
+ * El reloj del timeout de estabilizacion SI vuelve a cero: cada re-armado
+ * cuenta como una espera nueva.
  */
 void scale_continue_weighing(float min_weight_g);
 
