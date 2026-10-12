@@ -58,6 +58,14 @@ CONFIG_GDMA_CTRL_FUNC_IN_IRAM=y
 # y veniamos corriendo con 1536. Se fija para no estrecharlo sin querer.
 CONFIG_ESP_IPC_TASK_STACK_SIZE=1536
 
+# Optimizar por tamano (-Os) en vez de por depuracion (-Og). OJO: esto es
+# lo que de verdad manda; build_type de platformio.ini NO cambia el nivel
+# de optimizacion en una compilacion ESP-IDF, lo hace esta opcion.
+# Las aserciones se quedan activas a proposito (ASSERTION_LEVEL=2): en un
+# almacen vale mas que reviente con un mensaje claro que no que siga
+# adelante con un estado imposible.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
 # Nombres largos en FATFS (datos_maestros.csv/inventario.csv superan 8.3)
 CONFIG_FATFS_LFN_HEAP=y
 
