@@ -6,3 +6,11 @@ CONFIG_FATFS_LFN_HEAP=y
 
 # Modo USB Mass Storage (exponer la SD como disco USB)
 CONFIG_TINYUSB_MSC_ENABLED=y
+
+# Tabla de particiones propia (partitions.csv). OJO: quien de verdad genera
+# la tabla en este proyecto es board_build.partitions de platformio.ini - el
+# builder de PlatformIO para ESP-IDF lee board.build.partitions e IGNORA
+# estas opciones (ver espidf.py, partitions_csv = board.get(...)). Esta
+# linea solo esta para que una compilacion con idf.py, o una regeneracion
+# del sdkconfig, coincidan con lo que flashea PlatformIO.
+CONFIG_PARTITION_TABLE_CUSTOM=y

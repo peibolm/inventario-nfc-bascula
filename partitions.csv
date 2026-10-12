@@ -1,0 +1,30 @@
+# Tabla de particiones del proyecto. La selecciona board_build.partitions
+# de platformio.ini (el builder de ESP-IDF de PlatformIO lee
+# board.build.partitions, no las CONFIG_PARTITION_TABLE_* del sdkconfig).
+#
+# Sustituye a la partitions_singleapp.csv de serie de ESP-IDF, que reserva
+# 1MB para la app porque asume un chip de 2MB; este lleva 16MB y la imagen
+# ya iba por el 81% de ese megabyte.
+#
+# nvs y phy_init conservan offset y tamano EXACTOS respecto a la tabla
+# anterior: asi los ajustes guardados en NVS (settings.c) sobreviven al
+# reflasheo. Solo crece la particion de app. Un erase_flash si los borra.
+#
+# Sin OTA a proposito: una unica particion 'factory', se actualiza por USB.
+# Si algun dia hiciera falta OTA habria que rehacer este reparto con
+# otadata + ota_0 + ota_1 del mismo tamano, y reflashear por cable una vez.
+#
+# El offset de la app debe estar alineado a 64KB (0x10000).
+#
+# Mapa resultante sobre los 16MB:
+#   0x000000  32KB   bootloader (fuera de la tabla)
+#   0x008000   4KB   la propia tabla de particiones
+#   0x009000  24KB   nvs
+#   0x00f000   4KB   phy_init
+#   0x010000   3MB   factory  <- la app
+#   0x310000  ~12.9MB libres para lo que haga falta mas adelante
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x300000,
