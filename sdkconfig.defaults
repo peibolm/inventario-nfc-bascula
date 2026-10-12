@@ -1,6 +1,63 @@
 # fix for build issue
 CONFIG_FREERTOS_HZ=1000
 
+# ---------------------------------------------------------------------------
+# Hardware de la placa (JC3248W535: ESP32-S3, 8MB PSRAM octal, 16MB flash)
+#
+# Esto estaba SOLO en sdkconfig.LVGL-320-480, que es un fichero generado
+# ("Automatically generated file. DO NOT EDIT.") aunque este commiteado: lo
+# configuro con menuconfig el repo del que venimos
+# (NorthernMan54/JC3248W535EN) y nunca llego aqui.
+#
+# El problema es que ESP-IDF solo lee este fichero cuando el sdkconfig NO
+# existe. Al regenerar uno que ya esta, conserva lo que encuentra - por eso
+# la PSRAM sobrevivia a los cambios de version del framework. Pero borrando
+# el generado (lo tipico para forzar una regeneracion limpia) se perdia
+# entera, el firmware compilaba igual y reventaba al arrancar: el
+# framebuffer de LVGL son 320*480*2 = 300KB y no caben en la RAM interna.
+#
+# Con esto, borrar el generado vuelve a ser inofensivo.
+# ---------------------------------------------------------------------------
+
+# PSRAM octal a 80MHz. Sin esto no arranca.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_CLK_IO=30
+CONFIG_SPIRAM_CS_IO=26
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_MEMTEST=y
+CONFIG_SPIRAM_ECC_ENABLE=y
+
+# malloc() reparte entre RAM interna y PSRAM: lo de <=4KB (practicamente
+# todos los widgets de LVGL) se queda dentro, lo grande va a PSRAM. Los
+# buffers de dibujo eligen explicitamente con heap_caps_malloc().
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# Flash de 16MB en QIO. Sin la talla correcta, el build avisa de
+# "Flash memory size mismatch" y la tabla de particiones no cuadra.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=y
+
+# Los buffers de FATFS (microSD) a PSRAM, que de RAM interna vamos mas
+# justos: los dos transport buffers de LVGL ya se llevan 60KB de DMA.
+CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y
+
+# Control del GDMA en IRAM. El por defecto de IDF es 'n', pero la pantalla
+# va por QSPI con DMA y aqui se escribe NVS (ajustes), que deshabilita la
+# cache de flash: con estas funciones en flash, una operacion de DMA
+# durante esa ventana se cuelga.
+CONFIG_GDMA_CTRL_FUNC_IN_IRAM=y
+
+# Stack de la tarea IPC: el por defecto de IDF bajo a 1280 en algun momento
+# y veniamos corriendo con 1536. Se fija para no estrecharlo sin querer.
+CONFIG_ESP_IPC_TASK_STACK_SIZE=1536
+
 # Nombres largos en FATFS (datos_maestros.csv/inventario.csv superan 8.3)
 CONFIG_FATFS_LFN_HEAP=y
 
